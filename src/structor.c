@@ -1700,6 +1700,64 @@ static void set_knob8_normalized(StructorInstance *inst, float norm) {
 }
 
 /* ========================================================================
+   State persistence
+
+   Schwung saves a module by calling get_param("state") and restores AFTER
+   create_instance() via set_param("state", json). It does NOT feed saved
+   state through create_instance(). On a successful JSON.parse the host
+   re-emits the state PRETTY-PRINTED ("key": "value", with newlines), so the
+   parser must be key-based and whitespace/newline tolerant — a positional
+   sscanf breaks on the round-trip. Every non-trigger param, across all pages,
+   is listed here or it silently resets to its default on reload.
+
+   "preset" is FIRST on purpose: apply_structor_preset() overwrites nearly
+   every other param, so it must be applied before the individual values are
+   restored on top of it. Momentary triggers (rnd_preset, rnd_reverb,
+   rnd_filter) and the derived "Special" knob (a view onto the mode-specific
+   params already listed) are intentionally excluded.
+   ======================================================================== */
+
+static const char *STATE_KEYS[] = {
+    /* Presets page (apply FIRST — overwrites the params below) */
+    "preset",
+    /* Structor page */
+    "envelope", "density", "grain_size", "time_warp", "feedback", "mode",
+    "mix", "detection",
+    /* Mode-specific "Special" targets */
+    "shuffle_bias", "pitch_range_window", "octave_fold", "density_curve",
+    "speed_curve_exp", "arp_pattern", "deltarupt_attack", "density_morphing",
+    /* Randomize page */
+    "rnd_envelope", "rnd_density", "rnd_grain", "rnd_time", "rnd_pan",
+    "seq_on", "seq_time", "seq_mult",
+    /* Presets page reverb/filter */
+    "master_filter", "rev_mix", "rev_size", "rev_decay", "rev_damp"
+};
+#define STATE_KEY_COUNT ((int)(sizeof(STATE_KEYS)/sizeof(STATE_KEYS[0])))
+
+/* Extract the quoted string value for "key". Searches for the fully-quoted
+   key ("mix" never matches inside a longer key) and tolerates whitespace or
+   newlines after the colon, so it survives the host's pretty-printed
+   re-serialization. Returns 0 on success, -1 if the key is absent. */
+static int structor_json_get_str(const char *json, const char *key,
+                                 char *out, int out_len) {
+    char search[48];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(json, search);
+    if (!p) return -1;
+    p += strlen(search);
+    while (*p == ':' || *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return -1;
+    p++;
+    const char *end = strchr(p, '"');
+    if (!end) return -1;
+    int len = (int)(end - p);
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, p, (size_t)len);
+    out[len] = '\0';
+    return 0;
+}
+
+/* ========================================================================
    API: set_param
    ======================================================================== */
 
@@ -1895,51 +1953,18 @@ static void structor_set_param(void *instance, const char *key, const char *val)
             }
         }
     }
-    /* State serialization */
+    /* State restore: parse the JSON snapshot key-by-key and route each value
+       through the per-key handlers above (reusing their clamping and enum-name
+       matching). Whitespace/newline tolerant, key-order independent, and a
+       missing key simply leaves that param alone. STATE_KEYS lists "preset"
+       first so apply_structor_preset() runs before the individual params
+       overwrite it. */
     else if (strcmp(key, "state") == 0) {
-        int m = 0, ap = 0, of = 0, sqon = 0;
-        float det = 0.1f, env = 0.2f, den = 0.7f, gs = 1.0f, tw = 1.0f;
-        float mx = 0.5f, fb = 0.2f;
-        float sb = 0.5f, prw = 0.0f, dc = 0.0f, sce = 1.0f, da = 0.05f, dm = 0.0f;
-        float re = 0.0f, rd = 0.0f, rg = 0.0f, rt = 0.0f, rp = 0.25f, stms = 200.0f;
-        int sqmult = 4, rndf = 0;
-        sscanf(val,
-            "{\"detection\":%f,\"envelope\":%f,\"density\":%f,\"grain_size\":%f,\"time_warp\":%f,"
-            "\"mix\":%f,\"feedback\":%f,\"mode\":%d,"
-            "\"shuffle_bias\":%f,\"pitch_range_window\":%f,\"octave_fold\":%d,"
-            "\"density_curve\":%f,\"speed_curve_exp\":%f,"
-            "\"arp_pattern\":%d,\"deltarupt_attack\":%f,\"density_morphing\":%f,"
-            "\"rnd_envelope\":%f,\"rnd_density\":%f,\"rnd_grain\":%f,\"rnd_time\":%f,"
-            "\"rnd_pan\":%f,"
-            "\"seq_on\":%d,\"seq_time\":%f,\"seq_mult\":%d,\"rnd_filter\":%d}",
-            &det, &env, &den, &gs, &tw, &mx, &fb, &m,
-            &sb, &prw, &of, &dc, &sce, &ap, &da, &dm,
-            &re, &rd, &rg, &rt, &rp, &sqon, &stms, &sqmult, &rndf);
-        inst->detection = clampf(det, 0.0f, 1.0f);
-        inst->envelope = clampf(env, 0.0f, 1.0f);
-        inst->density = clampf(den, 0.05f, 20.0f);
-        inst->grain_size = clampf(gs, 0.1f, 40.0f);
-        inst->time_warp = clampf(tw, 0.25f, 8.0f);
-        inst->mix = clampf(mx, 0.0f, 1.0f);
-        inst->feedback = clampf(fb, 0.0f, 0.95f);
-        inst->mode = clampi(m, 0, MAX_MODES - 1);
-        inst->shuffle_bias = clampf(sb, 0.0f, 1.0f);
-        inst->pitch_range_window = clampf(prw, 0.0f, 1.0f);
-        inst->octave_fold = clampi(of, 0, MAX_OCTAVE_FOLD - 1);
-        inst->density_curve = clampf(dc, 0.0f, 1.0f);
-        inst->speed_curve_exp = clampf(sce, 0.5f, 2.0f);
-        inst->arp_pattern = clampi(ap, 0, MAX_ARP - 1);
-        inst->deltarupt_attack = clampf(da, 0.0f, 1.0f);
-        inst->density_morphing = clampf(dm, 0.0f, 1.0f);
-        inst->rnd_envelope = clampf(re, 0.0f, 1.0f);
-        inst->rnd_density = clampf(rd, 0.0f, 1.0f);
-        inst->rnd_grain = clampf(rg, 0.0f, 1.0f);
-        inst->rnd_time = clampf(rt, 0.0f, 1.0f);
-        inst->rnd_pan = clampf(rp, 0.0f, 1.0f);
-        inst->seq_on = clampi(sqon, 0, 1);
-        inst->seq_time_ms = clampf(stms, 10.0f, 1000.0f);
-        inst->seq_mult = clampi(sqmult, 0, MAX_SEQ_MULT - 1);
-        inst->rnd_filter = clampi(rndf, 0, 100);
+        char vb[48];
+        for (int i = 0; i < STATE_KEY_COUNT; i++) {
+            if (structor_json_get_str(val, STATE_KEYS[i], vb, sizeof(vb)) == 0)
+                structor_set_param(instance, STATE_KEYS[i], vb);
+        }
     }
 }
 
@@ -2174,24 +2199,27 @@ static int structor_get_param(void *instance, const char *key, char *buf, int bu
     }
 
     /* ---- State serialization ---- */
+    /* Full snapshot for Schwung autosave / set reload. Every non-trigger param
+       across all pages (see STATE_KEYS) is emitted as a quoted string holding
+       the SAME raw representation its per-key get_param returns (raw float text
+       or the enum option name), so it round-trips straight back through the
+       state restore above. Guards against buffer overflow. */
     else if (strcmp(key, "state") == 0) {
-        return snprintf(buf, buf_len,
-            "{\"detection\":%.4f,\"envelope\":%.4f,\"density\":%.4f,\"grain_size\":%.4f,\"time_warp\":%.4f,"
-            "\"mix\":%.4f,\"feedback\":%.4f,\"mode\":%d,"
-            "\"shuffle_bias\":%.4f,\"pitch_range_window\":%.4f,\"octave_fold\":%d,"
-            "\"density_curve\":%.4f,\"speed_curve_exp\":%.4f,"
-            "\"arp_pattern\":%d,\"deltarupt_attack\":%.4f,\"density_morphing\":%.4f,"
-            "\"rnd_envelope\":%.4f,\"rnd_density\":%.4f,\"rnd_grain\":%.4f,\"rnd_time\":%.4f,"
-            "\"rnd_pan\":%.4f,"
-            "\"seq_on\":%d,\"seq_time\":%d,\"seq_mult\":%d,\"rnd_filter\":%d}",
-            inst->detection, inst->envelope, inst->density, inst->grain_size, inst->time_warp,
-            inst->mix, inst->feedback, inst->mode,
-            inst->shuffle_bias, inst->pitch_range_window, inst->octave_fold,
-            inst->density_curve, inst->speed_curve_exp,
-            inst->arp_pattern, inst->deltarupt_attack, inst->density_morphing,
-            inst->rnd_envelope, inst->rnd_density, inst->rnd_grain, inst->rnd_time,
-            inst->rnd_pan,
-            inst->seq_on, (int)inst->seq_time_ms, inst->seq_mult, inst->rnd_filter);
+        if (buf_len < 2) return -1;
+        int n = 0;
+        buf[n++] = '{';
+        for (int i = 0; i < STATE_KEY_COUNT; i++) {
+            char vb[48];
+            if (structor_get_param(instance, STATE_KEYS[i], vb, sizeof(vb)) < 0) continue;
+            int w = snprintf(buf + n, (size_t)(buf_len - n), "%s\"%s\":\"%s\"",
+                             (n > 1) ? "," : "", STATE_KEYS[i], vb);
+            if (w < 0 || w >= buf_len - n) return -1;   /* would overflow */
+            n += w;
+        }
+        if (n + 1 >= buf_len) return -1;
+        buf[n++] = '}';
+        buf[n] = '\0';
+        return n;
     }
 
     return -1;
@@ -2214,6 +2242,6 @@ static audio_fx_api_v2_t g_api = {
 __attribute__((visibility("default")))
 audio_fx_api_v2_t* move_audio_fx_init_v2(const host_api_v1_t *host) {
     g_host = host;
-    if (host && host->log) host->log("[structor] Structor v0.1.0 loaded");
+    if (host && host->log) host->log("[structor] Structor v0.3.2 loaded");
     return &g_api;
 }
